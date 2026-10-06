@@ -1,0 +1,8 @@
+{
+  "name": "agent",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "validate": "claude plugin validate . && claude plugin validate plugins/agent-loop"
+  }
+}

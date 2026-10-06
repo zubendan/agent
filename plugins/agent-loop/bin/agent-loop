@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# agent-loop: runs a project's autonomous agent loop, one fresh Claude Code
+# session per iteration, each driven by the agent-loop:orchestrator agent and
+# picking up from agent/HANDOFF.md. Operator guide: the plugin's README.md.
+#
+# Usage, from anywhere inside the project's git repo:
+#   agent-loop [--once] [--dry-run] [--quiet] [--max-sessions N]
+#   agent-loop checkpoint-due     # the orchestrator asks this after each task
+#
+# Stops when: Ctrl-C, agent/STOP exists, the handoff says DONE or BLOCKED, the
+# session cap is reached, sessions stop producing commits outside agent/, or
+# sessions keep failing.
+
+set -uo pipefail
+
+# A session that dies (kill, crash, budget cut) never writes its agent/LOG.md
+# line. Append and commit a stub for session $1 if LOG.md has no "S<n> " line.
+# Only agent/LOG.md goes into the commit; other uncommitted changes stay put.
+record_missing_log_line() {
+  local n=$1 log=agent/LOG.md
+  grep -q "^S$n " "$log" 2>/dev/null && return 0
+  [ -s "$log" ] && [ -n "$(tail -c 1 "$log")" ] && echo >>"$log"
+  echo "S$n $(date +%Y-%m-%d) killed: no log line written (see agent/runtime/logs/session-$(printf %03d "$n").jsonl)" >>"$log"
+  git commit -q -m "chore(agent): S$n killed without a log line; record a stub" -- "$log" >/dev/null 2>&1 ||
+    echo "[agent-loop] recorded a stub line for S$n in $log but could not commit it" >&2
+  return 0
+}
+
+# Commits in $1..HEAD that touch anything outside agent/. Every session commits
+# agent/ (the handoff guard makes it), so only these count as progress.
+commits_outside_agent() {
+  git rev-list --count "$1..HEAD" -- . ':(exclude)agent' 2>/dev/null || echo 0
+}
+
+# Distinct task ids closed since the newest checkpoint-* tag, counted from the
+# orchestrator's "chore(agent): S<n> close <id>" commits.
+tasks_since_checkpoint() {
+  local tag
+  tag=$(git describe --tags --match 'checkpoint-*' --abbrev=0 2>/dev/null)
+  git log --format=%s "${tag:+$tag..}HEAD" 2>/dev/null |
+    sed -nE 's/^chore\(agent\): S[0-9]+ close ([A-Za-z0-9_-]+).*/\1/p' | sort -u | wc -l | tr -d ' '
+}
+
+# Prints whether a checkpoint is due and raises the flag for a periodic one.
+# A due checkpoint stays due until a checkpoint session clears the flag, so a
+# crashed or interrupted session can't skip it.
+checkpoint_due() {
+  local flag=agent/runtime/CHECKPOINT_DUE every=${AGENT_CHECKPOINT_EVERY_TASKS:-15} done_count trigger
+  if [ -f "$flag" ]; then
+    trigger=$(tr -d '\n' <"$flag")
+    echo "due: ${trigger:-milestone complete}"
+    return 0
+  fi
+  done_count=$(tasks_since_checkpoint)
+  if [ "$done_count" -ge "$every" ]; then
+    mkdir -p agent/runtime
+    echo periodic >"$flag"
+    echo "due: periodic ($done_count tasks closed since the last checkpoint)"
+  else
+    echo "not due ($done_count of $every tasks since the last checkpoint)"
+  fi
+}
+
+# Sourced (by the tests): define the functions only, don't run anything.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "agent-loop: not inside a git repository" >&2; exit 2; }
+cd "$root" || exit 1
+
+if [ "${1:-}" = checkpoint-due ]; then
+  checkpoint_due
+  exit 0
+fi
+
+for f in agent/HANDOFF.md agent/PROJECT.md; do
+  [ -f "$f" ] || { echo "agent-loop: $root/$f is missing; run /agent-loop:init in this project first" >&2; exit 2; }
+done
+
+plugin_root=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+project=$(basename "$root")
+
+max_sessions=${AGENT_MAX_SESSIONS:-40}
+once=0
+dry_run=0
+quiet=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --once) once=1 ;;
+    --dry-run) dry_run=1 ;;
+    --quiet) quiet=1 ;;
+    --max-sessions) max_sessions=$2; shift ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+export AGENT_LOOP=1
+export AGENT_CONTEXT_BUDGET_PCT=${AGENT_CONTEXT_BUDGET_PCT:-30}
+export AGENT_CONTEXT_WINDOW=${AGENT_CONTEXT_WINDOW:-1000000}
+export AGENT_CHECKPOINT_EVERY_TASKS=${AGENT_CHECKPOINT_EVERY_TASKS:-15}
+
+runtime=agent/runtime
+mkdir -p "$runtime/logs" "$runtime/budget"
+counter="$runtime/session-count"
+checkpoint_flag="$runtime/CHECKPOINT_DUE"
+[ -f "$counter" ] || echo 0 >"$counter"
+
+# Ctrl-C reaches claude too, which exits cleanly; the trap makes the loop stop
+# with it instead of starting the next session.
+stop_requested=0
+trap 'stop_requested=1' INT TERM
+
+notify() {
+  echo "[agent-loop] $1"
+  command -v osascript >/dev/null &&
+    osascript -e "display notification \"$1\" with title \"$project agent loop\"" >/dev/null 2>&1
+}
+
+handoff_status() {
+  awk -F': *' '/^status:/ { sub(/ *#.*/, "", $2); print $2; exit }' agent/HANDOFF.md
+}
+
+for_human_hash() {
+  [ -f agent/FOR-HUMAN.md ] && shasum agent/FOR-HUMAN.md | cut -d' ' -f1
+}
+
+# One line per orchestrator action; subagent internals stay in the log.
+progress_filter='
+  fromjson? |
+  (now | localtime | strftime("%H:%M")) as $t |
+  if .type == "assistant" and .parent_tool_use_id == null then
+    .message.content[]? |
+    if .type == "text" then "  \($t)   \(.text | gsub("\\s+"; " ") | .[0:160])"
+    elif .type == "tool_use" and .name == "Agent" then "  \($t) > \(.input.subagent_type // "agent"): \(.input.description // "")"
+    elif .type == "tool_use" then "  \($t)   \(.name): \((.input.description // .input.command // .input.file_path // "") | tostring | gsub("\\s+"; " ") | .[0:110])"
+    else empty end
+  elif .type == "result" then "  \($t) = \(.subtype), \(.num_turns) turns, $\(.total_cost_usd * 100 | round / 100)"
+  else empty end'
+
+# The loop script itself can die with a session (terminal closed, machine
+# restarted); then the stub above never ran. Catch up on the last session.
+last=$(cat "$counter")
+[ "$dry_run" = 0 ] && [ "$last" -gt 0 ] && record_missing_log_line "$last"
+
+no_progress=0
+failures=0
+ran=0
+
+while :; do
+  [ "$stop_requested" = 1 ] && { notify "Stopped (interrupt)."; exit 130; }
+  [ -f agent/STOP ] && { notify "Stopped: agent/STOP exists."; exit 0; }
+  case "$(handoff_status)" in
+    DONE) notify "Roadmap complete (handoff says DONE)."; exit 0 ;;
+    BLOCKED) notify "Blocked: human input needed. See agent/FOR-HUMAN.md and agent/HANDOFF.md."; exit 0 ;;
+  esac
+  [ "$ran" -ge "$max_sessions" ] && { notify "Session cap ($max_sessions) reached."; exit 0; }
+
+  [ "$dry_run" = 0 ] && checkpoint_due >/dev/null
+
+  n=$(($(cat "$counter") + 1))
+  mode=work
+  trigger=""
+  if [ -f "$checkpoint_flag" ]; then
+    mode=checkpoint
+    trigger=$(tr -d '\n' <"$checkpoint_flag")
+    [ -n "$trigger" ] || trigger="milestone complete"
+  fi
+
+  prompt="Mode: ${mode}. Session: ${n}.${trigger:+ Trigger: ${trigger}.} Follow your session procedure."
+  log="$runtime/logs/session-$(printf %03d "$n").jsonl"
+  cmd=(claude -p "$prompt" --agent agent-loop:orchestrator --plugin-dir "$plugin_root"
+       --permission-mode auto --output-format stream-json --verbose --name "agent-loop S$n")
+  [ -n "${AGENT_MODEL:-}" ] && cmd+=(--model "$AGENT_MODEL")
+  [ -n "${AGENT_MAX_BUDGET_USD:-}" ] && cmd+=(--max-budget-usd "$AGENT_MAX_BUDGET_USD")
+
+  if [ "$dry_run" = 1 ]; then
+    printf '[agent-loop] would run S%s (%s):' "$n" "$mode"; printf ' %q' "${cmd[@]}"; echo
+    echo "[agent-loop] tasks closed since the last checkpoint: $(tasks_since_checkpoint) of $AGENT_CHECKPOINT_EVERY_TASKS"
+    exit 0
+  fi
+
+  echo "[agent-loop] $(date +%H:%M) S$n ($mode${trigger:+: $trigger}) starting. Full log: $log"
+  echo "$n" >"$counter"
+  head_before=$(git rev-parse HEAD 2>/dev/null)
+  human_before=$(for_human_hash)
+  touch "$runtime/session.start"
+  if [ "$quiet" = 1 ]; then
+    "${cmd[@]}" >"$log" 2>"$log.stderr"
+  else
+    "${cmd[@]}" 2>"$log.stderr" | tee "$log" | jq --unbuffered -rR "$progress_filter"
+  fi
+  ran=$((ran + 1))
+  progress=$(commits_outside_agent "$head_before")  # before the stub commit
+  record_missing_log_line "$n"
+
+  [ "$stop_requested" = 1 ] && { notify "Stopped (interrupt) during S$n. Its last per-task commit is the resume point."; exit 130; }
+
+  # The budget hook reads Claude Code's transcript files, whose layout is not a
+  # public contract. If it measured nothing, the budget is silently off.
+  if grep -q '"name":"Agent"' "$log" && [ ! "$runtime/budget/measured-sub" -nt "$runtime/session.start" ]; then
+    notify "S$n: the context-budget hook measured no subagent; subagents ran without a budget. See the plugin README, 'Context budget'."
+  fi
+  [ "$runtime/budget/measured-main" -nt "$runtime/session.start" ] ||
+    notify "S$n: the context-budget hook measured nothing for the orchestrator."
+  model=$(jq -r 'select(.type == "system" and .subtype == "init") | .model' "$log" 2>/dev/null | head -n 1)
+  case "$model" in
+    *"[1m]"*|"") ;;
+    *) [ "$AGENT_CONTEXT_WINDOW" -gt 200000 ] &&
+         notify "S$n ran on $model, but AGENT_CONTEXT_WINDOW is $AGENT_CONTEXT_WINDOW; set it to the model's window." ;;
+  esac
+
+  [ "$(for_human_hash)" != "$human_before" ] && notify "S$n updated agent/FOR-HUMAN.md: $(sed -n 's/^1\. //p' agent/FOR-HUMAN.md | head -n 1 | cut -c1-120)"
+
+  result=$(jq -r 'select(.type == "result") | "\(.subtype) \(.is_error)"' "$log" 2>/dev/null | tail -n 1)
+  if [ "${result#* }" != "false" ]; then
+    failures=$((failures + 1))
+    [ "$failures" -ge 5 ] && { notify "5 failed sessions in a row; see $log and $log.stderr"; exit 1; }
+    wait_s=$((300 * 2 ** (failures - 1)))
+    [ "$wait_s" -gt 3600 ] && wait_s=3600
+    echo "[agent-loop] S$n failed (${result:-no result}); retrying in ${wait_s}s (failure $failures/5)"
+    sleep "$wait_s"
+    continue
+  fi
+  failures=0
+
+  # A checkpoint session changes only agent/, so it never counts against progress.
+  if [ "$mode" = work ] && [ "$progress" -eq 0 ]; then
+    no_progress=$((no_progress + 1))
+    [ "$no_progress" -ge 3 ] && { notify "No commits outside agent/ in 3 work sessions; stopping. See agent/HANDOFF.md."; exit 1; }
+  elif [ "$mode" = work ]; then
+    no_progress=0
+  fi
+
+  [ "$once" = 1 ] && { notify "S$n finished (--once)."; exit 0; }
+done

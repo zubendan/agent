@@ -1,0 +1,5 @@
+{
+  "name": "agent-loop",
+  "description": "Unattended agent loop: fresh sessions that resume from a file baton, with context budgets, review, and checkpoints",
+  "author": { "name": "Daniel Zubenko" }
+}

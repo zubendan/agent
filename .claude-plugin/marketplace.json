@@ -1,0 +1,12 @@
+{
+  "name": "agent",
+  "owner": { "name": "Daniel Zubenko" },
+  "description": "Personal Claude Code skills and plugins",
+  "plugins": [
+    {
+      "name": "agent-loop",
+      "source": "./plugins/agent-loop",
+      "description": "Unattended agent loop: fresh sessions that resume from a file baton, with context budgets, review, and checkpoints"
+    }
+  ]
+}
