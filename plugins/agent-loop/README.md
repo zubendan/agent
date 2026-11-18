@@ -16,7 +16,9 @@ The marketplace is a local directory, so the plugin loads in place: edits under 
 
 Once per project, in a Claude Code session at the project root: `/agent-loop:init`. It writes `agent/`, fills in `agent/PROJECT.md` with you, drafts a roadmap, and wires `.gitignore`, `.claude/settings.json` and `CLAUDE.md`.
 
-Needs `git`, `jq` and `bash`; notifications use `osascript` on macOS.
+Needs `git`, `jq` and `bash`. Notifications use `osascript` on macOS, a toast through PowerShell on Windows, and `notify-send` on Linux. Set `AGENT_NOTIFY_CMD` to a program that takes a title and a message to send them somewhere else, such as your phone.
+
+**Windows.** Run the loop from Git Bash (it comes with Git for Windows). Claude Code runs the hooks through the same bash, and the loop calls Windows Gradle and other native tools directly, with no WSL. `ln -s` in Git Bash copies the file instead of linking it, so put the runner on PATH instead: add `export PATH="$HOME/agent/plugins/agent-loop/bin:$PATH"` to `~/.bashrc`, adjusted to wherever you cloned the repo.
 
 ## How it works
 
@@ -64,7 +66,7 @@ Run it in a terminal you can leave open, e.g. `tmux new -s loop agent-loop`.
 - 3 work sessions in a row commit nothing outside `agent/`, or the CLI fails 5 times in a row (retries back off from 5 minutes to 1 hour).
 - The session cap is reached.
 
-A macOS notification fires on each stop, and whenever a session changes `agent/FOR-HUMAN.md`.
+A desktop notification fires on each stop, and whenever a session changes `agent/FOR-HUMAN.md`.
 
 ## Watching and steering
 

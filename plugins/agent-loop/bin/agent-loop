@@ -110,11 +110,33 @@ checkpoint_flag="$runtime/CHECKPOINT_DUE"
 stop_requested=0
 trap 'stop_requested=1' INT TERM
 
+# Desktop notification: $AGENT_NOTIFY_CMD (called with title and message) if set,
+# else macOS osascript, a Windows toast through PowerShell, or notify-send.
 notify() {
   echo "[agent-loop] $1"
-  command -v osascript >/dev/null &&
-    osascript -e "display notification \"$1\" with title \"$project agent loop\"" >/dev/null 2>&1
+  local title="$project agent loop"
+  if [ -n "${AGENT_NOTIFY_CMD:-}" ]; then
+    "$AGENT_NOTIFY_CMD" "$title" "$1" >/dev/null 2>&1
+  elif command -v osascript >/dev/null; then
+    osascript -e "display notification \"$1\" with title \"$title\"" >/dev/null 2>&1
+  elif command -v powershell.exe >/dev/null; then
+    NOTIFY_TITLE=$title NOTIFY_TEXT=$1 \
+      powershell.exe -NoProfile -NonInteractive -Command "$windows_toast" >/dev/null 2>&1
+  elif command -v notify-send >/dev/null; then
+    notify-send "$title" "$1" >/dev/null 2>&1
+  fi
+  return 0
 }
+
+# Title and text arrive through the environment, so nothing is quoted into code.
+windows_toast='
+  $m = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+  $x = $m::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+  $t = $x.GetElementsByTagName("text")
+  [void]$t.Item(0).AppendChild($x.CreateTextNode($env:NOTIFY_TITLE))
+  [void]$t.Item(1).AppendChild($x.CreateTextNode($env:NOTIFY_TEXT))
+  $id = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+  $m::CreateToastNotifier($id).Show([Windows.UI.Notifications.ToastNotification]::new($x))'
 
 handoff_status() {
   awk -F': *' '/^status:/ { sub(/ *#.*/, "", $2); print $2; exit }' agent/HANDOFF.md
